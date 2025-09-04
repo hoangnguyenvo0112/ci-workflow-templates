@@ -1,9 +1,7 @@
-#https://github.com/ocean-network-express/ghq-bpit-vesselrefueling.git
 #jobs:
 #  scan_without_api_key:
 #    uses: ./.github/workflows/upload-artifact-to-gcs.yml@security-testings
-#Different repo
-#    uses: uses: ocean-network-express/ghq-bpit-vesselrefueling/.github/workflows/upload-artifact-to-gcs.yml@security-testing
+
 name: Upload Artifacts to GCS
 on:
   workflow_call:
@@ -17,7 +15,6 @@ on:
         description: 'GCP Project ID (optional, can use secret instead)'
         required: false
         type: string
-        default: 'one-global-dilab-sandbox-dev'
       gcs_bucket:
         description: 'GCS bucket name (optional, can use secret instead)'
         required: false
@@ -26,16 +23,13 @@ on:
       defectdojo_url:
         description: "DefectDojo Server URL"
         required: true
-        type: string
-        default: "https://34.143.209.142"
       api_token:
         description: "DefectDojo API Token"
         type: string
         required: true
-        default: "734f853b267962f2ca03dad38778092744e296c8"
         
     secrets:
-      GCP_SA_KEY:
+      GCP_SA_KEY_ONE_GLOBAL_DILAB_SANDBOX_DEV:
         description: 'GCP Service Account JSON key'
         required: false
 jobs:
@@ -55,12 +49,6 @@ jobs:
       uses: google-github-actions/auth@v2
       with:
         credentials_json: ${{ secrets.GCP_SA_KEY }}
-    
-    # - name: Authenticate to Google_Cloud_v2
-    #     uses: google-github-actions/auth@v2
-    #     with:
-    #       workload_identity_provider: 'projects/one-global-dilab-sandbox-dev/locations/global/workloadIdentityPools/YOUR_POOL_ID/providers/YOUR_PROVIDER_ID'
-    #       service_account: 'your-service-account-email@your-gcp-project-id.iam.gserviceaccount.com'
     
     - name: Set up Google Cloud SDK
       uses: google-github-actions/setup-gcloud@v2
