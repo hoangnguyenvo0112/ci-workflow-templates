@@ -1,0 +1,289 @@
+#https://github.com/ocean-network-express/ghq-bpit-vesselrefueling.git
+#jobs:
+#  scan_without_api_key:
+#    uses: ./.github/workflows/upload-artifact-to-gcs.yml@security-testings
+#Different repo
+#    uses: uses: ocean-network-express/ghq-bpit-vesselrefueling/.github/workflows/upload-artifact-to-gcs.yml@security-testing
+name: Upload Artifacts to GCS
+on:
+  workflow_call:
+    inputs:
+      artifact_path:
+        description: 'Path to artifacts to upload'
+        required: false
+        type: string
+        default: 'reports'
+      gcp_project_id:
+        description: 'GCP Project ID (optional, can use secret instead)'
+        required: false
+        type: string
+        default: 'one-global-dilab-sandbox-dev'
+      gcs_bucket:
+        description: 'GCS bucket name (optional, can use secret instead)'
+        required: false
+        type: string
+        default: 'ghq-diai-prod-security-reports'
+      defectdojo_url:
+        description: "DefectDojo Server URL"
+        required: true
+        type: string
+        default: "https://34.143.209.142"
+      api_token:
+        description: "DefectDojo API Token"
+        type: string
+        required: true
+        default: "734f853b267962f2ca03dad38778092744e296c8"
+        
+    secrets:
+      GCP_SA_KEY:
+        description: 'GCP Service Account JSON key'
+        required: false
+jobs:
+  upload-artifacts:
+    permissions:
+      contents: 'read'
+      id-token: 'write'
+    runs-on: ubuntu-latest
+    steps:
+    - name: Set up date variables
+      id: date
+      run: |
+        echo "YEAR=$(date +'%Y')" >> $GITHUB_ENV
+        echo "MONTH=$(date +'%m')" >> $GITHUB_ENV
+        
+    - name: Authenticate to Google Cloud
+      uses: google-github-actions/auth@v2
+      with:
+        credentials_json: ${{ secrets.GCP_SA_KEY }}
+    
+    # - name: Authenticate to Google_Cloud_v2
+    #     uses: google-github-actions/auth@v2
+    #     with:
+    #       workload_identity_provider: 'projects/one-global-dilab-sandbox-dev/locations/global/workloadIdentityPools/YOUR_POOL_ID/providers/YOUR_PROVIDER_ID'
+    #       service_account: 'your-service-account-email@your-gcp-project-id.iam.gserviceaccount.com'
+    
+    - name: Set up Google Cloud SDK
+      uses: google-github-actions/setup-gcloud@v2
+    
+    - name: Download Dependency Check Artifact
+      continue-on-error: true
+      uses: actions/download-artifact@v4
+      with:
+        name: dependency-check-report
+        path: dependency-check-report
+    
+    - name: Download Container Scan Artifact
+      continue-on-error: true
+      uses: actions/download-artifact@v4
+      with:
+        name: security-container-scaner
+        path: security-container-scaner
+    
+    - name: Download Code Quality Artifact
+      continue-on-error: true
+      uses: actions/download-artifact@v4
+      with:
+        name: code-quality-scan-reports
+        path: code-quality-scan-reports
+
+    - name: Download CodeQL Github
+      continue-on-error: true
+      uses: actions/download-artifact@v4
+      with:
+        name: codeql-results-scan
+        path: codeql-results-scan
+
+    - name: Download Checkov Security
+      continue-on-error: true
+      uses: actions/download-artifact@v4
+      with:
+        name: checkov-security-reports
+        path: checkov-security-reports
+        
+    - name: Extract repository name
+      id: repo_name
+      run: |
+        REPO_NAME=$(echo "${{ github.repository }}" | cut -d'/' -f2)
+        echo "repo_name=$REPO_NAME" >> "$GITHUB_OUTPUT"
+        
+    - name: Consolidate all reports into a single folder
+      run: |
+        shopt -s nullglob 
+        
+        mkdir -p ${{ inputs.artifact_path }}
+        
+        if [ -d "dependency-check-report" ]; then
+          find dependency-check-report -type f | while read -r file; do
+            mv "$file" "${{ inputs.artifact_path }}/${{ steps.repo_name.outputs.repo_name }}-dependency-check.${file##*.}"
+            echo "Moved $file"
+          done
+        fi
+        
+        if [ -n "$(ls -A security-container-scaner 2>/dev/null)" ]; then
+          mv security-container-scaner/* ${{ inputs.artifact_path }}/
+        fi
+        
+        if [ -n "$(ls -A codeql-results-scan 2>/dev/null)" ]; then
+          mv codeql-results-scan/* ${{ inputs.artifact_path }}/
+        fi
+        
+        if [ -n "$(ls -A code-quality-scan-reports 2>/dev/null)" ]; then
+          mv code-quality-scan-reports/* ${{ inputs.artifact_path }}/
+        fi
+
+        if [ -n "$(ls -A checkov-security-reports 2>/dev/null)" ]; then
+          mv checkov-security-reports/* ${{ inputs.artifact_path }}/
+        fi
+
+        cp -r ${{ inputs.artifact_path }} ${{ steps.repo_name.outputs.repo_name }}
+        
+        find "${{ inputs.artifact_path }}" -type f ! -name "*.html" -delete
+        find "${{ inputs.artifact_path }}" -type d -empty -delete
+        shopt -u nullglob 
+    
+    - name: Upload artifacts to GCS
+      id: upload_step
+      run: |
+        GCS_PATH="gs://${{ inputs.gcs_bucket }}/reports/${{ env.YEAR }}/${{ env.MONTH }}"
+        echo "gcs_path=$GCS_PATH" >> "$GITHUB_OUTPUT"
+    
+        echo "Uploading artifacts from '${{ inputs.artifact_path }}' to $GCS_PATH"
+        if [ -n "$(ls -A ${{ inputs.artifact_path }})" ]; then
+          gsutil -m cp -r ${{ inputs.artifact_path }}/* "$GCS_PATH/"
+          gsutil cp -r ${{ steps.repo_name.outputs.repo_name }} "$GCS_PATH/"
+        else
+          echo "Directory '${{ inputs.artifact_path }}' is empty, skipping."
+        fi
+        echo "Upload completed successfully"
+ 
+    - name: Install jq & curl
+      run: sudo apt-get install -y jq curl
+
+    - name: Check & Create Product if Needed
+      env:
+        DEFECTDOJO_URL: ${{ inputs.defectdojo_url }}
+        API_TOKEN: ${{ inputs.api_token }}
+        PRODUCT_NAME: ${{ steps.repo_name.outputs.repo_name }}
+      run: |
+        set -x 
+    
+        PRODUCT_API_URL="${DEFECTDOJO_URL}/api/v2/products/"
+        echo "🔍 Checking if product '$PRODUCT_NAME' exists..."
+        
+        RESPONSE=$(curl -k -s --location "$PRODUCT_API_URL" \
+          --header "accept: application/json" \
+          --header "Authorization: Token $API_TOKEN")
+    
+        if ! echo "$RESPONSE" | jq -e '.results' > /dev/null 2>&1; then
+          echo "Error querying products. Please check your URL and Token."
+          echo "Response from server: $RESPONSE"
+          exit 1
+        fi
+    
+        EXISTS=$(echo "$RESPONSE" | jq -r --arg NAME "$PRODUCT_NAME" '.results[] | select(.name == $NAME) | .id')
+    
+        if [ -z "$EXISTS" ]; then
+          echo "🆕 Product does not exist. Preparing to create '$PRODUCT_NAME'..."
+    
+          JSON_PAYLOAD=$(jq -n \
+            --arg name "$PRODUCT_NAME" \
+            --arg desc "Product created automatically by GitHub Actions for the '${{ github.repository }}' repository." \
+            '{
+              name: $name,
+              description: $desc,
+              prod_type: 2,
+              platform: "web service",
+              lifecycle: "construction",
+              origin: "third party library",
+              tags: ["github", "monthly-security-report"]
+            }')
+    
+          CREATE_RESPONSE=$(curl -k -s -w "\n%{http_code}" --location "$PRODUCT_API_URL" \
+            --header "Content-Type: application/json" \
+            --header "Authorization: Token $API_TOKEN" \
+            --data-raw "$JSON_PAYLOAD")
+          
+          HTTP_CODE=$(echo "$CREATE_RESPONSE" | tail -n1)
+          BODY=$(echo "$CREATE_RESPONSE" | sed '$d')
+    
+          if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+              echo "Product '$PRODUCT_NAME' created successfully."
+              echo "Response Body: $BODY"
+          else
+              echo "Failed to create product. HTTP Status: $HTTP_CODE"
+              echo "Response Body: $BODY"
+              exit 1
+          fi
+        else
+          echo "Product '$PRODUCT_NAME' already exists with ID: $EXISTS"
+        fi
+        
+    - name: Upload Scan Reports to DefectDojo
+      env:
+        DEFECTDOJO_URL: ${{ inputs.defectdojo_url }}
+        API_TOKEN: ${{ inputs.api_token }}
+        PRODUCT_NAME: ${{ steps.repo_name.outputs.repo_name }}
+        REPORTS_DIR: ${{ steps.repo_name.outputs.repo_name }}
+      run: |
+        set -x
+    
+        SCAN_API_URL="${DEFECTDOJO_URL}/api/v2/import-scan/"
+    
+        if [ ! -d "$REPORTS_DIR" ]; then
+          echo "Reports directory '$REPORTS_DIR' not found. Skipping upload."
+          exit 0 
+        fi
+    
+        echo "🔎 Scanning directory '$REPORTS_DIR' for reports..."
+    
+        find "$REPORTS_DIR" -type f -print0 | while IFS= read -r -d '' report_path; do
+          filename=$(basename "$report_path")
+          scan_type=""
+    
+          case "$filename" in
+              *container*.json) scan_type="Trivy Scan" ;;
+              *inline*.json) scan_type="Bandit Scan" ;;
+              *sast*.json) scan_type="Semgrep JSON Report" ;;
+              *dependency*.xml) scan_type="Dependency Check Scan" ;;
+              *iac*.json) scan_type="Checkov Scan" ;;
+              *)
+                echo "Skipping file '$filename' as it is not a recognized report type."
+                continue
+                ;;
+          esac
+          
+          engagement_name="${scan_type} $(date +%Y-%m-%d)"
+          
+          echo "-----------------------------------------------------"
+          echo "  - Scan Type: $scan_type"
+          echo "  - Product Name: $PRODUCT_NAME"
+          echo "  - Engagement Name: $engagement_name"
+          echo "-----------------------------------------------------"
+          
+          UPLOAD_OUTPUT=$(curl -k --fail --show-error -s --location "$SCAN_API_URL" \
+            --header "Authorization: Token $API_TOKEN" \
+            --form "scan_type=$scan_type" \
+            --form "product_name=$PRODUCT_NAME" \
+            --form "engagement_name=$engagement_name" \
+            --form "source_code_management_uri=${{ github.server_url }}/${{ github.repository }}" \
+            --form "commit_hash=${{ github.sha }}" \
+            --form 'tags=github' \
+            --form 'tags=monthly-security-report' \
+            --form 'branch_tag=${{ github.ref_name }}' \
+            --form 'auto_create_context=true' \
+            --form "file=@$report_path" \
+            --form 'active=true' \
+            --form 'verified=false' \
+            --form "scan_date=$(date +%Y-%m-%d)")
+          
+          CURL_EXIT_CODE=$?
+          if [ $CURL_EXIT_CODE -eq 0 ]; then
+            echo "Scan report '$filename' uploaded successfully."
+            echo "Response: $UPLOAD_OUTPUT"
+          else
+            echo "Failed to upload '$filename'. Curl exited with code $CURL_EXIT_CODE."
+            echo "Error details from API: $UPLOAD_OUTPUT"
+          fi
+        done
+    
+        echo "All recognized reports have been processed."

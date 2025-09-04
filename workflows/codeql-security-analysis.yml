@@ -1,0 +1,470 @@
+name: CodeQL Security Analysis
+
+on:
+  workflow_call:
+    inputs:
+      languages:
+        description: 'Languages to analyze (comma-separated). Supported: cpp, csharp, go, java, javascript, python, ruby'
+        required: false
+        type: string
+        default: ''
+      
+      working-directory:
+        description: 'Working directory for the analysis'
+        required: false
+        type: string
+        default: '.'
+      
+      queries:
+        description: 'Additional CodeQL queries to run (comma-separated)'
+        required: false
+        type: string
+        default: ''
+      
+      upload-results:
+        description: 'Upload results to GitHub Security tab'
+        required: false
+        type: boolean
+        default: false
+      
+      fail-on-error:
+        description: 'Fail the workflow if CodeQL finds issues'
+        required: false
+        type: boolean
+        default: false
+      
+      config-file:
+        description: 'Path to CodeQL configuration file'
+        required: false
+        type: string
+        default: ''
+
+jobs:
+  codeql-analysis:
+    name: CodeQL Security Analysis
+    runs-on: ubuntu-latest
+    
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          
+      - id: repo_name
+        run: |
+          REPO_NAME=$(echo "${{ github.repository }}" | cut -d'/' -f2)
+          echo "repo_name=$REPO_NAME" >> "$GITHUB_OUTPUT"
+      
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+      
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.x'
+      
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+      
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ inputs.languages }}
+          queries: ${{ inputs.queries }}
+          config-file: ${{ inputs.config-file }}
+          tools: linked
+      
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+        with:
+          working-directory: ${{ inputs.working-directory }}
+      
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{ inputs.languages }}"
+          upload: ${{ inputs.upload-results }}
+          output: results
+          checkout_path: ${{ inputs.working-directory }}
+           
+      - name: Process and Format Results
+        if: always()
+        id: process_results
+        run: |
+          echo "CodeQL analysis completed for ${{ inputs.languages }}"
+          SARIF_FILE=$(find results -name "*.sarif" | head -n 1)
+          
+          # Get repository name for file naming
+          REPO_NAME=$(echo "${{ github.repository }}" | cut -d'/' -f2)
+          REPORT_HTML="results/${REPO_NAME}-codeql-report.html"
+          
+          if [ -f "$SARIF_FILE" ]; then
+            echo "✅ SARIF results found at $SARIF_FILE"
+            
+            FINAL_SARIF="results/${REPO_NAME}-codeql-analysis.sarif"
+            mv "$SARIF_FILE" "$FINAL_SARIF"
+            SARIF_FILE="$FINAL_SARIF"
+
+            RESULT_COUNT=$(jq -r '.runs[0].results | length' "$SARIF_FILE" 2>/dev/null || echo "0")
+            echo "📋 Found $RESULT_COUNT security issues."
+            
+            echo "🎨 Generating HTML report..."
+            
+            # Generate HTML report with embedded SARIF data
+            cat > "$REPORT_HTML" << 'HTMLEOF'
+          <!DOCTYPE html>
+          <html lang="en">
+          <head>
+              <meta charset="UTF-8">
+              <meta name="viewport" content="width=device-width, initial-scale=1.0">
+              <title>CodeQL Security Report</title>
+              <style>
+                  body { 
+                      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; 
+                      margin: 0; 
+                      padding: 20px; 
+                      background: #f6f8fa; 
+                      line-height: 1.5;
+                  }
+                  .container { 
+                      max-width: 1200px; 
+                      margin: 0 auto; 
+                      background: white; 
+                      border-radius: 8px; 
+                      box-shadow: 0 1px 3px rgba(0,0,0,0.1); 
+                  }
+                  .header { 
+                      background: linear-gradient(90deg, #0366d6, #0969da); 
+                      color: white; 
+                      padding: 20px; 
+                      border-radius: 8px 8px 0 0; 
+                  }
+                  .header h1 { margin: 0 0 10px 0; }
+                  .header p { margin: 0; opacity: 0.9; }
+                  .stats { 
+                      display: flex; 
+                      gap: 20px; 
+                      padding: 20px; 
+                      background: #f1f8ff; 
+                      border-bottom: 1px solid #d1d9e0; 
+                      flex-wrap: wrap;
+                  }
+                  .stat { 
+                      text-align: center; 
+                      flex: 1;
+                      min-width: 120px;
+                  }
+                  .stat-number { 
+                      font-size: 24px; 
+                      font-weight: bold; 
+                      color: #0366d6; 
+                      display: block;
+                  }
+                  .stat-label {
+                      color: #586069;
+                      font-size: 14px;
+                  }
+                  .results { padding: 20px; }
+                  .result-item { 
+                      border: 1px solid #d1d9e0; 
+                      border-radius: 6px; 
+                      margin: 15px 0; 
+                      padding: 15px; 
+                      background: #fafbfc;
+                  }
+                  .severity-error { border-left: 4px solid #d73a49; }
+                  .severity-warning { border-left: 4px solid #fb8500; }
+                  .severity-note { border-left: 4px solid #28a745; }
+                  .severity-info { border-left: 4px solid #0366d6; }
+                  .rule-header {
+                      display: flex;
+                      justify-content: space-between;
+                      align-items: center;
+                      margin-bottom: 10px;
+                      flex-wrap: wrap;
+                      gap: 10px;
+                  }
+                  .rule-id { 
+                      font-family: 'SFMono-Regular', Consolas, monospace; 
+                      background: #f6f8fa; 
+                      padding: 4px 8px; 
+                      border-radius: 3px; 
+                      font-size: 12px;
+                      border: 1px solid #d1d9e0;
+                  }
+                  .severity-badge {
+                      padding: 2px 8px;
+                      border-radius: 12px;
+                      font-size: 12px;
+                      font-weight: bold;
+                      text-transform: uppercase;
+                  }
+                  .severity-badge.error { background: #ffeaea; color: #d73a49; }
+                  .severity-badge.warning { background: #fff8e1; color: #fb8500; }
+                  .severity-badge.note { background: #e6ffed; color: #28a745; }
+                  .severity-badge.info { background: #e1f5ff; color: #0366d6; }
+                  .location { 
+                      color: #586069; 
+                      font-size: 14px; 
+                      font-family: 'SFMono-Regular', Consolas, monospace;
+                  }
+                  .message { 
+                      margin: 10px 0; 
+                      font-weight: 600;
+                  }
+                  .description {
+                      color: #586069;
+                      font-size: 14px;
+                      margin-top: 8px;
+                  }
+                  .no-results { 
+                      text-align: center; 
+                      padding: 60px 20px; 
+                      color: #586069; 
+                  }
+                  .no-results h3 {
+                      color: #28a745;
+                      margin-bottom: 10px;
+                  }
+                  .loading {
+                      text-align: center;
+                      padding: 40px;
+                      color: #586069;
+                  }
+                  .error-state {
+                      text-align: center;
+                      padding: 40px;
+                      color: #d73a49;
+                  }
+              </style>
+          </head>
+          <body>
+              <div class="container">
+                  <div class="header">
+                      <h1>🔍 CodeQL Security Analysis Report</h1>
+                      <p>Language: <strong id="language-info">Loading...</strong> | Generated: <span id="generation-time">Loading...</span></p>
+                  </div>
+                  <div class="stats">
+                      <div class="stat">
+                          <span class="stat-number" id="total-issues">-</span>
+                          <div class="stat-label">Total Issues</div>
+                      </div>
+                      <div class="stat">
+                          <span class="stat-number" id="error-count">-</span>
+                          <div class="stat-label">Errors</div>
+                      </div>
+                      <div class="stat">
+                          <span class="stat-number" id="warning-count">-</span>
+                          <div class="stat-label">Warnings</div>
+                      </div>
+                      <div class="stat">
+                          <span class="stat-number" id="note-count">-</span>
+                          <div class="stat-label">Notes</div>
+                      </div>
+                  </div>
+                  <div class="results" id="results-container">
+                      <div class="loading">
+                          <h3>Loading results...</h3>
+                          <p>Processing SARIF data...</p>
+                      </div>
+                  </div>
+              </div>
+              <script>
+                  document.getElementById('generation-time').textContent = new Date().toLocaleString();
+                  const sarifData = 
+          HTMLEOF
+          
+            # Append SARIF data to the HTML file
+            cat "$SARIF_FILE" >> "$REPORT_HTML"
+            
+            # Complete the HTML file with JavaScript and closing tags
+            cat >> "$REPORT_HTML" << 'JSEOF'
+                  ;
+                  
+                  document.getElementById('language-info').textContent = '${{ inputs.languages }}';
+                  
+                  function processSarifData() {
+                      try {
+                          if (!sarifData || !sarifData.runs || sarifData.runs.length === 0) {
+                              showError('Invalid SARIF data structure');
+                              return;
+                          }
+                          
+                          const run = sarifData.runs[0];
+                          const results = run.results || [];
+                          const rules = run.tool?.driver?.rules || [];
+                          
+                          const ruleMap = {};
+                          rules.forEach(rule => {
+                              ruleMap[rule.id] = rule;
+                          });
+                          
+                          document.getElementById('total-issues').textContent = results.length;
+                          
+                          let errorCount = 0, warningCount = 0, noteCount = 0, infoCount = 0;
+                          
+                          const container = document.getElementById('results-container');
+                          
+                          if (results.length === 0) {
+                              container.innerHTML = `
+                                  <div class="no-results">
+                                      <h3>🎉 No security issues found!</h3>
+                                      <p>Your code looks secure according to CodeQL analysis.</p>
+                                  </div>`;
+                              document.getElementById('error-count').textContent = '0';
+                              document.getElementById('warning-count').textContent = '0';
+                              document.getElementById('note-count').textContent = '0';
+                              return;
+                          }
+                          
+                          container.innerHTML = '';
+                          
+                          results.forEach((result, index) => {
+                              const rule = ruleMap[result.ruleId] || {};
+                              const level = result.level || rule.defaultConfiguration?.level || 'note';
+                              
+                              switch(level) {
+                                  case 'error': errorCount++; break;
+                                  case 'warning': warningCount++; break;
+                                  case 'note': noteCount++; break;
+                                  case 'info': infoCount++; break;
+                                  default: noteCount++; break;
+                              }
+                              
+                              const location = result.locations?.[0]?.physicalLocation;
+                              const uri = location?.artifactLocation?.uri || 'Unknown file';
+                              const startLine = location?.region?.startLine || '?';
+                              const startColumn = location?.region?.startColumn || '';
+                              const locationText = startColumn ? `${uri}:${startLine}:${startColumn}` : `${uri}:${startLine}`;
+                              
+                              const message = result.message?.text || rule.shortDescription?.text || 'Security issue detected';
+                              const description = rule.fullDescription?.text || result.message?.text || '';
+                              
+                              const resultHtml = `
+                                  <div class="result-item severity-${level}">
+                                      <div class="rule-header">
+                                          <span class="rule-id">${result.ruleId || 'Unknown'}</span>
+                                          <span class="severity-badge ${level}">${level}</span>
+                                      </div>
+                                      <div class="location">${locationText}</div>
+                                      <div class="message">${escapeHtml(message)}</div>
+                                      ${description && description !== message ? `<div class="description">${escapeHtml(description)}</div>` : ''}
+                                  </div>
+                              `;
+                              container.innerHTML += resultHtml;
+                          });
+                          
+                          document.getElementById('error-count').textContent = errorCount;
+                          document.getElementById('warning-count').textContent = warningCount;
+                          document.getElementById('note-count').textContent = noteCount + infoCount;
+                          
+                      } catch (error) {
+                          console.error('Error processing SARIF data:', error);
+                          showError('Failed to process SARIF data: ' + error.message);
+                      }
+                  }
+                  
+                  function showError(message) {
+                      const container = document.getElementById('results-container');
+                      container.innerHTML = `
+                          <div class="error-state">
+                              <h3>❌ Error Loading Results</h3>
+                              <p>${escapeHtml(message)}</p>
+                          </div>
+                      `;
+                      
+                      document.getElementById('total-issues').textContent = '?';
+                      document.getElementById('error-count').textContent = '?';
+                      document.getElementById('warning-count').textContent = '?';
+                      document.getElementById('note-count').textContent = '?';
+                  }
+                  
+                  function escapeHtml(text) {
+                      const div = document.createElement('div');
+                      div.textContent = text;
+                      return div.innerHTML;
+                  }
+                  
+                  processSarifData();
+              </script>
+          </body>
+          </html>
+          JSEOF
+
+            echo "✅ HTML report generated: $REPORT_HTML"
+            
+            if [ -f "$REPORT_HTML" ]; then
+              echo "📄 Report file size: $(wc -c < "$REPORT_HTML") bytes"
+            fi
+            
+          else
+            echo "❌ No SARIF results found for ${{ inputs.languages }}."
+            cat > "$REPORT_HTML" << 'NODATA'
+          <!DOCTYPE html>
+          <html lang="en">
+          <head>
+              <meta charset="UTF-8">
+              <meta name="viewport" content="width=device-width, initial-scale=1.0">
+              <title>CodeQL Security Report</title>
+              <style>
+                  body { 
+                      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; 
+                      padding: 40px; 
+                      text-align: center; 
+                      background: #f6f8fa;
+                  }
+                  .container {
+                      max-width: 600px;
+                      margin: 0 auto;
+                      background: white;
+                      padding: 40px;
+                      border-radius: 8px;
+                      box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+                  }
+                  h1 { color: #0366d6; }
+                  .status { color: #586069; margin: 20px 0; }
+              </style>
+          </head>
+          <body>
+              <div class="container">
+                  <h1>🔍 CodeQL Security Report</h1>
+                  <h2>Language: ${{ inputs.languages }}</h2>
+                  <div class="status">
+                      <p><strong>Status:</strong> Analysis completed but no SARIF result file was generated.</p>
+                      <p>This may indicate that no security issues were found or that the analysis encountered an issue.</p>
+                  </div>
+                  <p><em>Generated: $(date)</em></p>
+              </div>
+          </body>
+          </html>
+          NODATA
+          fi
+          
+          echo "sarif-file=$SARIF_FILE" >> $GITHUB_OUTPUT
+          echo "html-report=$REPORT_HTML" >> $GITHUB_OUTPUT
+          echo "result-count=$RESULT_COUNT" >> $GITHUB_OUTPUT
+
+      - name: Upload CodeQL Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: codeql-results-scan
+          path: |
+            results/${{ steps.repo_name.outputs.repo_name }}-codeql-report.html
+            results/${{ steps.repo_name.outputs.repo_name }}-codeql-analysis.sarif
+          retention-days: 15

@@ -1,0 +1,75 @@
+#https://github.com/ocean-network-express/ghq-bpit-vesselrefueling.git
+#jobs:
+#  scan_without_api_key:
+#    uses: ./.github/workflows/dependency_check.yml
+#Different repo
+#    uses: uses: ocean-network-express/ghq-bpit-vesselrefueling/.github/workflows/dependency_check.yml@security-testing
+name: Semgrep and Bandit Scan
+on:
+  workflow_call:
+    inputs:
+      has-python:
+        description: 'A boolean string ("true" or "false") indicating if the repo has Python code'
+        required: true
+        default: false
+        type: string
+    outputs:
+      artifact_id:
+        description: 'The ID of the uploaded artifact'
+        value: ${{ jobs.security_scan.outputs.artifact_id }}
+
+permissions:
+  contents: read
+
+jobs:
+  security_scan:
+    name: Semgrep and Bandit Scan
+    runs-on: ubuntu-latest
+    if: (github.actor != 'dependabot[bot]')
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python environment
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install Semgrep dependencies
+        run: pip install semgrep prospector2html
+
+      - name: Install Bandit dependency
+        if: inputs.has-python == 'true'
+        run: pip install bandit
+
+      - id: repo_name
+        run: |
+          REPO_NAME=$(echo "${{ github.repository }}" | cut -d'/' -f2)
+          echo "repo_name=$REPO_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Run Semgrep Scan
+        run: semgrep scan --config auto --json --exclude=.github --output ${{ steps.repo_name.outputs.repo_name }}-sast.json || true
+        env:
+          SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+
+      - name: Run Bandit Scan
+        if: inputs.has-python == 'true'
+        continue-on-error: true
+        run: |
+          bandit --recursive . --format html --output ${{ steps.repo_name.outputs.repo_name }}-inline_check.html -ll --exclude './.venv,./tests,.github' || true
+          bandit --recursive . --format json --output ${{ steps.repo_name.outputs.repo_name }}-inline_check.json -ll --exclude './.venv,./tests,.github' || true
+
+      - name: Generate Semgrep HTML Report
+        continue-on-error: true
+        run: prospector-html --input ${{ steps.repo_name.outputs.repo_name }}-sast.json --filter semgrep --output ${{ steps.repo_name.outputs.repo_name }}-sast.html || true
+
+      - name: Upload scan artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: code-quality-scan-reports
+          path: |
+            ${{ steps.repo_name.outputs.repo_name }}-sast.json
+            ${{ steps.repo_name.outputs.repo_name }}-sast.html
+            ${{ steps.repo_name.outputs.repo_name }}-inline_check.html
+            ${{ steps.repo_name.outputs.repo_name }}-inline_check.json
+          retention-days: 7

@@ -1,0 +1,123 @@
+name: Reusable Container Vulnerability Scan with Trivy
+
+on:
+  workflow_call:
+    inputs:
+      trivy-version:
+        description: 'The version of Trivy to use.'
+        type: string
+        required: false
+        default: '0.51.1'
+      trivy-severity:
+        description: 'Comma-separated list of severities to scan for (e.g., "HIGH,CRITICAL").'
+        type: string
+        required: false
+        default: 'HIGH,CRITICAL'
+      scan-path:
+        description: 'The path to scan with trivy fs.'
+        required: false
+        type: string
+        default: '.'
+
+jobs:
+  container-scan:
+    runs-on: ubuntu-latest
+    if: (github.actor != 'dependabot[bot]')
+    permissions:
+      security-events: write
+      contents: read
+      actions: read
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache Trivy database
+        uses: actions/cache@v4
+        with:
+          path: /home/runner/.cache/trivy
+          key: ${{ runner.os }}-trivy-${{ inputs.trivy-version }}
+          restore-keys: |
+            ${{ runner.os }}-trivy-
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        
+      - name: Install Trivy
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v${{ inputs.trivy-version }}
+          echo "Trivy v${{ inputs.trivy-version }} installed."
+
+      - name: Find Unique Dockerfile Directories
+        id: dockerfile_dirs
+        run: |
+          DIRS=$(find . -type f \( -name "Dockerfile" -o -name "*.dockerfile" \) -printf '%h\n' | sort -u | tr '\n' ' ')
+          echo "Found directories with Dockerfiles: ${DIRS}"
+          echo "dirs=${DIRS}" >> $GITHUB_OUTPUT
+
+      - name: Build Images from Dockerfiles
+        id: built_images
+        run: |
+          IMAGE_TAGS=""
+          for dir in ${{ steps.dockerfile_dirs.outputs.dirs }}; do
+            if [ -z "$dir" ]; then continue; fi
+            if [ "$dir" == "." ]; then
+              IMAGE_NAME=$(echo "${{ github.repository }}" | cut -d'/' -f2 | tr '[:upper:]' '[:lower:]')-root
+            else
+              IMAGE_NAME=$(echo "${{ github.repository }}" | cut -d'/' -f2 | tr '[:upper:]' '[:lower:]')-$(echo "$dir" | sed 's|^\./||' | tr '/' '-')
+            fi
+            IMAGE_TAG="${IMAGE_NAME}:latest"
+            echo "--- Building ${IMAGE_TAG} from directory ${dir} ---"
+            docker build -t "${IMAGE_TAG}" "${dir}"
+            IMAGE_TAGS="${IMAGE_TAGS} ${IMAGE_TAG}"
+          done
+          echo "tags=$(echo ${IMAGE_TAGS} | xargs)" >> $GITHUB_OUTPUT
+      
+      - id: repo_name
+        run: echo "repo_name=$(echo "${{ github.repository }}" | cut -d'/' -f2)" >> "$GITHUB_OUTPUT"
+      
+      - name: Run Trivy Scans to Generate JSON files
+        run: |
+          trivy fs \
+            --format json \
+            --scanners vuln,config,secret,license \
+            --severity "${{ inputs.trivy-severity }}" \
+            --output "${{ steps.repo_name.outputs.repo_name }}-filesystem-scan.json" \
+            "${{ inputs.scan-path }}"
+          if [ -n "${{ steps.built_images.outputs.tags }}" ]; then
+            trivy image \
+              --format json \
+              --scanners vuln,config,secret,license \
+              --severity "${{ inputs.trivy-severity }}" \
+              --output "${{ steps.repo_name.outputs.repo_name }}-container-scan.json" \
+              ${{ steps.built_images.outputs.tags }}
+          else
+            echo "No images built, skipping image scan."
+            echo '{"SchemaVersion": 2, "ArtifactName": "no-image-scanned", "Results": []}' > ${{ steps.repo_name.outputs.repo_name }}-container-scan.json
+          fi
+      
+      - name: Install and Generate Combined HTML Report
+        run: |
+          wget https://github.com/fatihtokus/scan2html/releases/download/v0.3.19-rc.1/scan2html_0.3.19-rc.1_linux-amd64.tar.gz
+          mkdir -p ~/.trivy/plugins/scan2html
+          tar -xvf scan2html_0.3.19-rc.1_linux-amd64.tar.gz -C ~/.trivy/plugins/scan2html
+          SOURCE_FILES="${{ steps.repo_name.outputs.repo_name }}-filesystem-scan.json"
+          if [ -n "${{ steps.built_images.outputs.tags }}" ]; then
+            echo "Image scan was performed. Adding container report to the list."
+            SOURCE_FILES="$SOURCE_FILES,${{ steps.repo_name.outputs.repo_name }}-container-scan.json"
+          else
+            echo "Image scan was skipped. Generating report from filesystem scan only."
+          fi
+          trivy scan2html generate --scan2html-flags --with-epss \
+            --output "${{ steps.repo_name.outputs.repo_name }}-container-scan.html" \
+            --from "$SOURCE_FILES"
+          pwd
+          ls -larth
+
+      - name: Upload Trivy Scan Report Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-container-scaner
+          path: |
+              ${{ steps.repo_name.outputs.repo_name }}-container-scan.json
+              ${{ steps.repo_name.outputs.repo_name }}-filesystem-scan.json
+              ${{ steps.repo_name.outputs.repo_name }}-container-scan.html
+          retention-days: 7

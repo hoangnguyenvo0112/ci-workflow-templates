@@ -1,0 +1,1009 @@
+#https://github.com/ocean-network-express/ghq-bpit-vesselrefueling.git
+#jobs:
+#  scan_without_api_key:
+#    uses: ./.github/workflows/dependency_check.yml@security-testings
+#Different repo
+#    uses: uses: ocean-network-express/ghq-bpit-vesselrefueling/.github/workflows/dependency_check.yml@security-testing
+name: Dependency Security Check Template
+
+on:
+  workflow_call:
+    inputs:
+      scan-path:
+        type: string
+        default: '.'
+      report-dir:
+        type: string
+        default: 'reports'
+      fail-cvss:
+        type: string
+        default: '7.0'
+      python-version:
+        type: string
+        default: '3.12'
+      java-version:
+        type: string
+        default: '21'
+      go-version:
+        type: string
+        default: '1.22'
+      dotnet-version:
+        type: string
+        default: '8.0'
+      node-version:
+        type: string
+        default: '22'
+      project-name:
+        type: string
+        default: ${{ github.repository }}
+    secrets:
+      DC_API_KEY:
+        description: 'Optional NVD API Key for faster scans'
+        required: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      has_python: ${{ steps.check_files.outputs.has_python }}
+      has_maven: ${{ steps.check_files.outputs.has_maven }}
+      has_gradle: ${{ steps.check_files.outputs.has_gradle }}
+      has_node: ${{ steps.check_files.outputs.has_node }}
+      has_go: ${{ steps.check_files.outputs.has_go }}
+      has_dotnet: ${{ steps.check_files.outputs.has_dotnet }}
+      has_conda: ${{ steps.check_files.outputs.has_conda }}
+      # has_docker: ${{ steps.check_files.outputs.has_docker }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check for dependency files
+        id: check_files
+        run: |
+          if find ${{ inputs.scan-path }} -type f \( -name "requirements.txt" -o -name "pyproject.toml" \) -print -quit | grep -q . ; then echo "has_python=true" >> $GITHUB_OUTPUT; fi
+          if find ${{ inputs.scan-path }} -type f \( -name "pom.xml" -o -name "build.sbt" \) -print -quit | grep -q . ; then echo "has_maven=true" >> $GITHUB_OUTPUT; fi
+          if find ${{ inputs.scan-path }} -type f \( -name "package-lock.json" -o -name "yarn.lock" -o -name "pnpm-lock.yaml" \) -print -quit | grep -q . ; then echo "has_node=true" >> $GITHUB_OUTPUT; fi
+          if find ${{ inputs.scan-path }} -type f \( -name "build.gradle" -o -name "build.gradle.kts" -o -name "gradle.properties" \) -print -quit | grep -q . ; then echo "has_gradle=true" >> $GITHUB_OUTPUT; fi
+          if find ${{ inputs.scan-path }} -type f -name "go.sum" -print -quit | grep -q . ; then echo "has_go=true" >> $GITHUB_OUTPUT; fi
+          if find ${{ inputs.scan-path }} -type f \( -name "*.csproj" -o -name "*.sln" -o -name "*.fsproj" -o -name "*.vbproj" -o -name "packages.lock.json" \) -print -quit | grep -q . ; then echo "has_dotnet=true" >> $GITHUB_OUTPUT; fi
+          if find ${{ inputs.scan-path }} -type f \( -name "conda-lock.yml" -o -name "environment.yml" \) -print -quit | grep -q . ; then echo "has_conda=true" >> $GITHUB_OUTPUT; fi
+          # if find ${{ inputs.scan-path }} -type f \( -name "Dockerfile" \) -print -quit | grep -q . ; then echo "has_docker=true" >> $GITHUB_OUTPUT; fi
+
+  build-python:
+    runs-on: ubuntu-latest
+    needs: prepare
+    if: needs.prepare.outputs.has_python == 'true'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+      - name: Install OWASP Dependency-Check
+        run: |
+          VERSION=$(curl -s https://dependency-check.github.io/DependencyCheck/current.txt)
+          curl -Ls "https://github.com/dependency-check/DependencyCheck/releases/download/v$VERSION/dependency-check-$VERSION-release.zip" --output dependency-check.zip
+          unzip dependency-check.zip
+          chmod +x dependency-check/bin/dependency-check.sh
+          echo "$PWD/dependency-check/bin" >> $GITHUB_PATH
+      - name: Cache Dependency-Check data
+        id: cache-dep-check
+        uses: actions/cache@v4
+        with:
+          path: ~/dependency-check/data
+          key: dependency-check-data-${{ runner.os }}
+          restore-keys: dependency-check-data-
+
+      - name: Write python script
+        continue-on-error: true
+        run: |
+          PY=$(cat <<EOF
+          import os
+          import sys
+          import subprocess
+          import argparse
+          from pathlib import Path
+          from typing import List, Set, Tuple
+          
+          PYPROJECT_FILENAME = "pyproject.toml"
+          REQUIREMENTS_FILENAME = "requirements.txt"
+          DEFAULT_REPORTS_DIR = "reports"
+          DEFAULT_MAX_DEPTH = 3
+          DEFAULT_CVSS_THRESHOLD = 7.0
+          
+          
+          class DependencyScanner:
+              def __init__(
+                  self,
+                  scan_path: str,
+                  project_name: str,
+                  output_dir: str = None,
+                  max_depth: int = DEFAULT_MAX_DEPTH,
+                  data: str = "dependency-check/data",
+                  dc_fail_cvss: float = DEFAULT_CVSS_THRESHOLD,
+              ):
+                  self.scan_path = self._resolve_path(scan_path)
+                  self.project_name = project_name
+                  self.output_dir = self._resolve_path(
+                      output_dir, default=self.scan_path / DEFAULT_REPORTS_DIR
+                  )
+                  self.max_depth = max_depth
+                  self.data = data
+                  self.dc_fail_cvss = dc_fail_cvss
+                  self.pyproject_paths: Set[Path] = set()
+                  self.requirements_paths: Set[Path] = set()
+          
+              @staticmethod
+              def _resolve_path(path_str: str | None, default: Path = None) -> Path:
+                  if not path_str:
+                      return default
+                  path = Path(path_str).resolve()
+                  path.mkdir(parents=True, exist_ok=True)
+                  return path
+          
+              def _run_command(self, cmd: List[str], cwd: Path) -> Tuple[bool, str, str]:
+                  try:
+                      process = subprocess.run(
+                          cmd, capture_output=True, text=True, check=False, cwd=cwd
+                      )
+                      success = process.returncode == 0
+                      return success, process.stdout, process.stderr
+                  except (FileNotFoundError, Exception) as e:
+                      print(f"Error running command {' '.join(cmd)}: {e}", file=sys.stderr)
+                      return False, "", str(e)
+          
+              def find_dependency_files(self) -> None:
+                  for i in range(self.max_depth + 1):
+                      pattern_prefix = "*/" * i
+                      for p in self.scan_path.glob(pattern_prefix + PYPROJECT_FILENAME):
+                          self.pyproject_paths.add(p.parent)
+                      for p in self.scan_path.glob(pattern_prefix + REQUIREMENTS_FILENAME):
+                          self.requirements_paths.add(p.parent)
+          
+              def filter_requirements_list(self) -> None:
+                  self.requirements_paths -= self.pyproject_paths
+          
+              def _install_for_project(self, path: Path, python_executable: str) -> bool:
+                  if path in self.pyproject_paths:
+                      cmd = [python_executable, "-m", "pip", "install", "-e", "."]
+                  else:
+                      req_file = path / REQUIREMENTS_FILENAME
+                      if not req_file.is_file():
+                          print(
+                              f"Warning: {REQUIREMENTS_FILENAME} not found in {path}, skipping.",
+                              file=sys.stderr,
+                          )
+                          return True
+                      cmd = [python_executable, "-m", "pip", "install", "-r", str(req_file)]
+          
+                  print(f"--- Installing dependencies for {path} ---")
+                  success, stdout, stderr = self._run_command(cmd, cwd=path)
+                  if not success:
+                      print(
+                          f"Error installing dependencies for {path}:\n{stderr}", file=sys.stderr
+                      )
+                  return success
+          
+              def install_dependencies(self, python_executable: str) -> None:
+                  all_paths = list(self.pyproject_paths | self.requirements_paths)
+                  if not all_paths:
+                      print("No dependency files found to install.")
+                      return
+          
+                  for path in all_paths:
+                      self._install_for_project(path, python_executable)
+          
+              def run_dependency_check(self) -> None:
+                  self.output_dir.mkdir(parents=True, exist_ok=True)
+          
+                  exclusions = [
+                      "**/vendor/bundle/**",
+                      "**/.git/**",
+                      "**/__pycache__/**",
+                      "**/tests/**",
+                      "**/test/**",
+                      "**/dependency-check/**",
+                      "**/requirements.txt/**",
+                      "**/__init__.py/**",
+                      "**/*.zip",
+                      "**/spec/**",
+                      "**/*.egg-info/**",
+                      "**/.pytest_cache/**",
+                      "**/.tox/**",
+                      "**/.coverage/**",
+                  ]
+          
+                  dc_cmd_name = "dependency-check.sh"
+                  cmd = [
+                      dc_cmd_name,
+                      "--project",
+                      self.project_name,
+                      "--scan",
+                      str(self.scan_path),
+                      "--out",
+                      str(self.output_dir),
+                      "--data",
+                      self.data,
+                      "--enableExperimental",
+                      "--format",
+                      "HTML",
+                      "--format",
+                      "XML",
+                      "--format",
+                      "JSON",
+                      f"--failOnCVSS={self.dc_fail_cvss}",
+                  ]
+                  for exclusion in exclusions:
+                      cmd.extend(["--exclude", exclusion])
+          
+                  nvd_api_key = os.getenv("DC_API_KEY")
+                  if nvd_api_key:
+                      cmd.extend(["--nvdApiKey", nvd_api_key])
+          
+                  success, _, stderr = self._run_command(cmd, cwd=self.scan_path)
+          
+                  if not success:
+                      print("Dependency-Check failed.", file=sys.stderr)
+                      if (
+                          "vulnerabilities were identified that meet or exceed the CVSS threshold"
+                          in stderr
+                      ):
+                          print(
+                              "CRITICAL: Vulnerabilities found exceeding the CVSS threshold!",
+                              file=sys.stderr,
+                          )
+                          sys.exit(2)
+          
+              def scan_and_check(self) -> None:
+                  try:
+                      self.find_dependency_files()
+                      self.filter_requirements_list()
+          
+                      print(
+                          f"--- Creating a single virtual environment in {self.scan_path / '.venv'} ---"
+                      )
+                      venv_path = self.scan_path / ".venv"
+                      create_venv_cmd = [sys.executable, "-m", "venv", str(venv_path)]
+                      success, _, stderr = self._run_command(create_venv_cmd, cwd=self.scan_path)
+                      if not success:
+                          print(
+                              f"CRITICAL: Failed to create central venv: {stderr}",
+                              file=sys.stderr,
+                          )
+                          raise RuntimeError("Could not create the central virtual environment.")
+          
+                      python_executable = str(venv_path / "bin" / "python")
+          
+                      self.install_dependencies(python_executable)
+          
+                      print("--- Starting Dependency-Check vulnerability scan ---")
+                      self.run_dependency_check()
+          
+                  except Exception as e:
+                      print(f"A critical error occurred: {e}", file=sys.stderr)
+                      raise
+          
+          
+          def main():
+              parser = argparse.ArgumentParser(
+                  description="A concurrent Python dependency scanner and security vulnerability checker.",
+                  formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+              )
+              parser.add_argument(
+                  "-p", "--scan-path", required=True, help="Path to the directory to scan."
+              )
+              parser.add_argument(
+                  "-n", "--project-name", required=True, help="Project name for the final report."
+              )
+              parser.add_argument(
+                  "-o", "--output-dir", help="Directory to save reports.", default=None
+              )
+              parser.add_argument(
+                  "-da",
+                  "--data",
+                  help="Directory to save data NVD.",
+                  default="dependency-check/data",
+              )
+              parser.add_argument(
+                  "-d",
+                  "--max-depth",
+                  type=int,
+                  default=DEFAULT_MAX_DEPTH,
+                  help="Maximum directory depth to search for dependency files.",
+              )
+              parser.add_argument(
+                  "-c",
+                  "--dc-fail-cvss",
+                  type=float,
+                  default=DEFAULT_CVSS_THRESHOLD,
+                  help="CVSS score threshold to fail the build.",
+              )
+              args = parser.parse_args()
+          
+              try:
+                  scanner = DependencyScanner(
+                      scan_path=args.scan_path,
+                      project_name=args.project_name,
+                      output_dir=args.output_dir,
+                      max_depth=args.max_depth,
+                      data=args.data,
+                      dc_fail_cvss=args.dc_fail_cvss,
+                  )
+                  scanner.scan_and_check()
+              except Exception as e:
+                  print(f"Scanner failed to complete: {e}", file=sys.stderr)
+                  sys.exit(1)
+          
+          
+          if __name__ == "__main__":
+              main()
+
+          EOF
+          )
+          
+          echo "PYTHON_SCRIPT<<EOF" >> $GITHUB_ENV
+          echo "$PY" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
+      - name: Dependency Check python
+        run: |
+          python3 -c "$PYTHON_SCRIPT" --scan-path "${{ inputs.scan-path }}" --project-name "${{ github.repository }}" --data ~/dependency-check/data --dc-fail-cvss "${{ inputs.fail-cvss }}" --output-dir "${{ inputs.report-dir }}/dependency-check"
+
+      - name: Upload Python artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-check-report
+          path:  ${{ inputs.report-dir }}
+          retention-days: 7
+
+  build-maven:
+    runs-on: ubuntu-latest
+    needs: prepare
+    if: needs.prepare.outputs.has_maven == 'true'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Set up JDK ${{ inputs.java-version }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ inputs.java-version }}
+          distribution: 'temurin'
+      - name: Install OWASP Dependency-Check
+        run: |
+          VERSION=$(curl -s https://dependency-check.github.io/DependencyCheck/current.txt)
+          curl -Ls "https://github.com/dependency-check/DependencyCheck/releases/download/v$VERSION/dependency-check-$VERSION-release.zip" --output dependency-check.zip
+          unzip dependency-check.zip
+          chmod +x dependency-check/bin/dependency-check.sh
+          echo "$PWD/dependency-check/bin" >> $GITHUB_PATH
+      - name: Cache Dependency-Check data
+        id: cache-dep-check
+        uses: actions/cache@v4
+        with:
+          path: ~/dependency-check/data
+          key: dependency-check-data-${{ runner.os }}
+          restore-keys: dependency-check-data-
+      - name: Find project root (shallowest pom.xml)
+        id: find_pom_dir
+        run: |
+          POM_PATH=$(find . -name "pom.xml" -not -path "./target/*" | awk -F'/' '{print NF, $0}' | sort -n | head -n 1 | cut -d' ' -f2-)
+          POM_DIR=$(dirname "$POM_PATH")
+          echo "Maven project directory found at: $POM_DIR"
+          echo "POM_DIR=$POM_DIR" >> $GITHUB_ENV
+      - name: Build with Maven
+        working-directory: ${{ env.POM_DIR }}
+        run: mvn clean package -DskipTests
+        continue-on-error: true
+      - name: Run Dependency Check
+        env:
+          DC_API_KEY: ${{ secrets.DC_API_KEY }}
+        run: |
+          mkdir -p ${{ inputs.report-dir }}
+          DC_ARGS="--project \"${{ inputs.project-name }}\" --scan \"${{ inputs.scan-path }}\" --data ~/dependency-check/data --out \"${{ inputs.report-dir }}\" --enableExperimental --format HTML --format XML --format JSON --failOnCVSS ${{ inputs.fail-cvss }}"
+          if [ -n "$DC_API_KEY" ]; then
+            DC_ARGS="$DC_ARGS --nvdApiKey \"$DC_API_KEY\""
+          fi
+          dependency-check.sh $DC_ARGS
+        continue-on-error: true
+      # - name: Upload Maven artifact
+      #   uses: actions/upload-artifact@v4
+      #   with:
+      #     name: maven-artifacts
+      #     path: ${{ inputs.scan-path }}/target
+      #     retention-days: 1
+      - name: Upload Dependency Check Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-check-report
+          path: ${{ inputs.report-dir }}
+          retention-days: 7
+
+  build-node:
+    runs-on: ubuntu-latest
+    needs: prepare
+    if: needs.prepare.outputs.has_node == 'true'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Setup Node.js ${{ inputs.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+      - name: Install OWASP Dependency-Check
+        run: |
+          VERSION=$(curl -s https://dependency-check.github.io/DependencyCheck/current.txt)
+          curl -Ls "https://github.com/dependency-check/DependencyCheck/releases/download/v$VERSION/dependency-check-$VERSION-release.zip" --output dependency-check.zip
+          unzip dependency-check.zip
+          chmod +x dependency-check/bin/dependency-check.sh
+          echo "$PWD/dependency-check/bin" >> $GITHUB_PATH
+      - name: Cache Dependency-Check data
+        id: cache-dep-check
+        uses: actions/cache@v4
+        with:
+          path: ~/dependency-check/data
+          key: dependency-check-data-${{ runner.os }}
+          restore-keys: dependency-check-data-
+      - name: Find Node.js project root
+        id: find_node_dir
+        run: |
+          PKG_PATH=$(find . -name "package.json" -not -path "./node_modules/*" | awk -F'/' '{print NF, $0}' | sort -n | head -n 1 | cut -d' ' -f2-)
+          NODE_DIR=$(dirname "$PKG_PATH")
+          echo "Node.js project directory found at: $NODE_DIR"
+          echo "NODE_DIR=$NODE_DIR" >> $GITHUB_ENV
+      - name: Install dependencies
+        working-directory: ${{ env.NODE_DIR }}
+        run: npm ci || yarn install || pnpm install
+        continue-on-error: true
+      - name: Build project
+        working-directory: ${{ env.NODE_DIR }}
+        run: npm run build || yarn build || pnpm build
+        continue-on-error: true
+      - name: Run Dependency Check
+        env:
+          DC_API_KEY: ${{ secrets.DC_API_KEY }}
+        run: |
+          mkdir -p ${{ inputs.report-dir }}
+          DC_ARGS="--project \"${{ inputs.project-name }}\" --scan \"${{ inputs.scan-path }}\" --data ~/dependency-check/data --out \"${{ inputs.report-dir }}\" --enableExperimental --format HTML --format XML --format JSON --failOnCVSS ${{ inputs.fail-cvss }}"
+          if [ -n "$DC_API_KEY" ]; then
+            DC_ARGS="$DC_ARGS --nvdApiKey \"$DC_API_KEY\""
+          fi
+          dependency-check.sh $DC_ARGS
+        continue-on-error: true
+      - name: Upload Node artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: node-artifacts
+          path: |
+            dist/
+            build/
+            node_modules/
+          retention-days: 1
+      - name: Upload Dependency Check Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-check-report
+          path: ${{ inputs.report-dir }}
+          retention-days: 7
+
+  build-gradle:
+    runs-on: ubuntu-latest
+    needs: prepare
+    if: needs.prepare.outputs.has_gradle == 'true'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Set up JDK ${{ inputs.java-version }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ inputs.java-version }}
+          distribution: 'temurin'
+      - name: Install OWASP Dependency-Check
+        run: |
+          VERSION=$(curl -s https://dependency-check.github.io/DependencyCheck/current.txt)
+          curl -Ls "https://github.com/dependency-check/DependencyCheck/releases/download/v$VERSION/dependency-check-$VERSION-release.zip" --output dependency-check.zip
+          unzip dependency-check.zip
+          chmod +x dependency-check/bin/dependency-check.sh
+          echo "$PWD/dependency-check/bin" >> $GITHUB_PATH
+      - name: Cache Dependency-Check data
+        id: cache-dep-check
+        uses: actions/cache@v4
+        with:
+          path: ~/dependency-check/data
+          key: dependency-check-data-${{ runner.os }}
+          restore-keys: dependency-check-data-
+      - name: Find Gradle project root
+        id: find_gradle_dir
+        run: |
+          GRADLEW_PATH=$(find . -name "gradlew" -type f -executable | awk -F'/' '{print NF, $0}' | sort -n | head -n 1 | cut -d' ' -f2-)
+          
+          GRADLE_DIR=$(dirname "$GRADLEW_PATH")
+          echo "Gradle project directory found at: $GRADLE_DIR"
+          echo "GRADLE_DIR=$GRADLE_DIR" >> $GITHUB_ENV
+      - name: Build with Gradle
+        working-directory: ${{ env.GRADLE_DIR }}
+        run: |
+          chmod +x ./gradlew
+          ./gradlew build -x test
+        continue-on-error: true
+      - name: Run Dependency Check
+        env:
+          DC_API_KEY: ${{ secrets.DC_API_KEY }}
+        run: |
+          mkdir -p ${{ inputs.report-dir }}
+          DC_ARGS="--project \"${{ inputs.project-name }}\" --scan \"${{ inputs.scan-path }}\" --data ~/dependency-check/data --out \"${{ inputs.report-dir }}\" --enableExperimental --format HTML --format XML --format JSON --failOnCVSS ${{ inputs.fail-cvss }}"
+          if [ -n "$DC_API_KEY" ]; then
+            DC_ARGS="$DC_ARGS --nvdApiKey \"$DC_API_KEY\""
+          fi
+          dependency-check.sh $DC_ARGS
+        continue-on-error: true
+      - name: Upload Gradle artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gradle-artifacts
+          path: |
+            build/
+            .gradle/
+          retention-days: 1
+      - name: Upload Dependency Check Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-check-report
+          path: ${{ inputs.report-dir }}
+          retention-days: 7
+
+  build-go:
+    runs-on: ubuntu-latest
+    needs: prepare
+    if: needs.prepare.outputs.has_go == 'true'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Setup Go ${{ inputs.go-version }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ inputs.go-version }}
+      - name: Install OWASP Dependency-Check
+        run: |
+          VERSION=$(curl -s https://dependency-check.github.io/DependencyCheck/current.txt)
+          curl -Ls "https://github.com/dependency-check/DependencyCheck/releases/download/v$VERSION/dependency-check-$VERSION-release.zip" --output dependency-check.zip
+          unzip dependency-check.zip
+          chmod +x dependency-check/bin/dependency-check.sh
+          echo "$PWD/dependency-check/bin" >> $GITHUB_PATH
+      - name: Cache Dependency-Check data
+        id: cache-dep-check
+        uses: actions/cache@v4
+        with:
+          path: ~/dependency-check/data
+          key: dependency-check-data-${{ runner.os }}
+          restore-keys: dependency-check-data-
+      - name: Find Go project root
+        id: find_go_dir
+        run: |
+          GO_MOD_PATH=$(find . -name "go.mod" -not -path "./.git/*" | awk -F'/' '{print NF, $0}' | sort -n | head -n 1 | cut -d' ' -f2-)
+          GO_DIR=$(dirname "$GO_MOD_PATH")
+          
+          echo "Go project directory found at: $GO_DIR"
+          echo "GO_DIR=$GO_DIR" >> $GITHUB_ENV
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: '${{ env.GO_DIR }}/go.mod'
+
+      - name: Build Go project
+        working-directory: ${{ env.GO_DIR }}
+        run: go build ./...
+        continue-on-error: true
+      - name: Run Dependency Check
+        env:
+          DC_API_KEY: ${{ secrets.DC_API_KEY }}
+        run: |
+          mkdir -p ${{ inputs.report-dir }}
+          DC_ARGS="--project \"${{ inputs.project-name }}\" --scan \"${{ inputs.scan-path }}\" --data ~/dependency-check/data --out \"${{ inputs.report-dir }}\" --enableExperimental --format HTML --format XML --format JSON --failOnCVSS ${{ inputs.fail-cvss }}"
+          if [ -n "$DC_API_KEY" ]; then
+            DC_ARGS="$DC_ARGS --nvdApiKey \"$DC_API_KEY\""
+          fi
+          dependency-check.sh $DC_ARGS
+        continue-on-error: true
+      - name: Upload Go artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: go-artifacts
+          path: |
+            bin/
+            vendor/
+          retention-days: 1
+      - name: Upload Dependency Check Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-check-report
+          path: ${{ inputs.report-dir }}
+          retention-days: 7
+
+  build-dotnet:
+    runs-on: ubuntu-latest
+    needs: prepare
+    if: needs.prepare.outputs.has_dotnet == 'true'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Setup .NET ${{ inputs.dotnet-version }}
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ inputs.dotnet-version }}.x
+      - name: Install OWASP Dependency-Check
+        run: |
+          VERSION=$(curl -s https://dependency-check.github.io/DependencyCheck/current.txt)
+          curl -Ls "https://github.com/dependency-check/DependencyCheck/releases/download/v$VERSION/dependency-check-$VERSION-release.zip" --output dependency-check.zip
+          unzip dependency-check.zip
+          chmod +x dependency-check/bin/dependency-check.sh
+          echo "$PWD/dependency-check/bin" >> $GITHUB_PATH
+      - name: Cache Dependency-Check data
+        id: cache-dep-check
+        uses: actions/cache@v4
+        with:
+          path: ~/dependency-check/data
+          key: dependency-check-data-${{ runner.os }}
+          restore-keys: dependency-check-data-
+      - name: Find .NET solution root
+        id: find_dotnet_dir
+        run: |
+          SLN_PATH=$(find . -name "*.sln" -not -path "./.git/*" | awk -F'/' '{print NF, $0}' | sort -n | head -n 1 | cut -d' ' -f2-)
+          DOTNET_DIR=$(dirname "$SLN_PATH")
+          
+          echo ".NET solution directory found at: $DOTNET_DIR"
+          echo "DOTNET_DIR=$DOTNET_DIR" >> $GITHUB_ENV
+          echo "SLN_PATH=$SLN_PATH" >> $GITHUB_ENV
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Restore dependencies
+        working-directory: ${{ env.DOTNET_DIR }}
+        run: dotnet restore ${{ env.SLN_PATH }}
+        continue-on-error: true
+
+      - name: Build project
+        working-directory: ${{ env.DOTNET_DIR }}
+        run: dotnet build ${{ env.SLN_PATH }} --no-restore
+        continue-on-error: true
+      - name: Run Dependency Check
+        env:
+          DC_API_KEY: ${{ secrets.DC_API_KEY }}
+        run: |
+          mkdir -p ${{ inputs.report-dir }}
+          DC_ARGS="--project \"${{ inputs.project-name }}\" --scan \"${{ inputs.scan-path }}\" --data ~/dependency-check/data --out \"${{ inputs.report-dir }}\" --enableExperimental --format HTML --format XML --format JSON --failOnCVSS ${{ inputs.fail-cvss }}"
+          if [ -n "$DC_API_KEY" ]; then
+            DC_ARGS="$DC_ARGS --nvdApiKey \"$DC_API_KEY\""
+          fi
+          dependency-check.sh $DC_ARGS
+        continue-on-error: true
+      - name: Upload .NET artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dotnet-artifacts
+          path: |
+            bin/
+            obj/
+          retention-days: 1
+      - name: Upload Dependency Check Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-check-report
+          path: ${{ inputs.report-dir }}
+          retention-days: 7
+
+  build-conda:
+    runs-on: ubuntu-latest
+    needs: prepare
+    if: needs.prepare.outputs.has_conda == 'true'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+      - name: Install OWASP Dependency-Check
+        run: |
+          VERSION=$(curl -s https://dependency-check.github.io/DependencyCheck/current.txt)
+          curl -Ls "https://github.com/dependency-check/DependencyCheck/releases/download/v$VERSION/dependency-check-$VERSION-release.zip" --output dependency-check.zip
+          unzip dependency-check.zip
+          chmod +x dependency-check/bin/dependency-check.sh
+          echo "$PWD/dependency-check/bin" >> $GITHUB_PATH
+      - name: Cache Dependency-Check data
+        id: cache-dep-check
+        uses: actions/cache@v4
+        with:
+          path: ~/dependency-check/data
+          key: dependency-check-data-${{ runner.os }}
+          restore-keys: dependency-check-data-
+      - name: Write python script
+        continue-on-error: true
+        run: |
+          PY=$(cat <<EOF
+          import os
+          import sys
+          import subprocess
+          import argparse
+          from pathlib import Path
+          from typing import List, Set, Tuple
+          
+          ENVIRONMENT_FILENAME = "environment.yml"
+          CONDA_LOCK_FILENAME = "conda-lock.yml"
+          
+          DEFAULT_REPORTS_DIR = "reports"
+          DEFAULT_MAX_DEPTH = 3
+          DEFAULT_CVSS_THRESHOLD = 7.0
+          
+          
+          class DependencyScanner:
+              def __init__(
+                  self,
+                  scan_path: str,
+                  project_name: str,
+                  output_dir: str = None,
+                  max_depth: int = DEFAULT_MAX_DEPTH,
+                  data: str = "dependency-check/data",
+                  dc_fail_cvss: float = DEFAULT_CVSS_THRESHOLD,
+              ):
+                  self.scan_path = self._resolve_path(scan_path)
+                  self.project_name = project_name
+                  self.output_dir = self._resolve_path(
+                      output_dir, default=self.scan_path / DEFAULT_REPORTS_DIR
+                  )
+                  self.max_depth = max_depth
+                  self.data = data
+                  self.dc_fail_cvss = dc_fail_cvss
+                  self.conda_env_paths: Set[Path] = set()
+          
+              @staticmethod
+              def _resolve_path(path_str: str | None, default: Path = None) -> Path:
+                  if not path_str:
+                      return default
+                  path = Path(path_str).resolve()
+                  path.mkdir(parents=True, exist_ok=True)
+                  return path
+          
+              def _run_command(self, cmd: List[str], cwd: Path) -> Tuple[bool, str, str]:
+                  try:
+                      process = subprocess.run(
+                          cmd, capture_output=True, text=True, check=False, cwd=cwd
+                      )
+                      success = process.returncode == 0
+                      return success, process.stdout, process.stderr
+                  except (FileNotFoundError, Exception) as e:
+                      print(f"Error running command {' '.join(cmd)}: {e}", file=sys.stderr)
+                      return False, "", str(e)
+          
+              def find_dependency_files(self) -> None:
+                  """Finds directories containing Conda environment files."""
+                  self.conda_env_paths.clear()
+                  for i in range(self.max_depth + 1):
+                      pattern_prefix = "*/" * i
+                      for p in self.scan_path.glob(pattern_prefix + ENVIRONMENT_FILENAME):
+                          self.conda_env_paths.add(p.parent)
+                      for p in self.scan_path.glob(pattern_prefix + CONDA_LOCK_FILENAME):
+                          self.conda_env_paths.add(p.parent)
+          
+              def _create_conda_env_for_project(self, path: Path) -> bool:
+                  """Creates a Conda environment from a file in the given path."""
+                  env_file = path / ENVIRONMENT_FILENAME
+                  lock_file = path / CONDA_LOCK_FILENAME
+          
+                  target_file = None
+                  if lock_file.is_file():
+                      target_file = lock_file
+                      print(f"Found {CONDA_LOCK_FILENAME} at {path}")
+                  elif env_file.is_file():
+                      target_file = env_file
+                      print(f"Found {ENVIRONMENT_FILENAME} at {path}")
+                  else:
+                      print(
+                          f"Warning: No Conda environment file found in {path}, skipping.",
+                          file=sys.stderr,
+                      )
+                      return True
+          
+                  relative_path_str = str(path.relative_to(self.scan_path)).replace(os.sep, "-")
+                  env_name_suffix = "root" if relative_path_str == "." else relative_path_str
+                  env_name = f"{self.project_name}-{env_name_suffix}"
+          
+                  print(f"--- Ensuring Conda environment '{env_name}' is clean ---")
+                  remove_cmd = ["conda", "env", "remove", "--name", env_name, "--yes"]
+                  self._run_command(remove_cmd, cwd=self.scan_path)
+          
+                  print(f"--- Creating Conda environment '{env_name}' from {target_file} ---")
+                  cmd = ["conda", "env", "create", "--name", env_name, "--file", str(target_file)]
+                  
+                  success, stdout, stderr = self._run_command(cmd, cwd=path)
+                  if not success:
+                      print(
+                          f"ERROR: Failed to create Conda environment '{env_name}' for {path}:\n{stderr}",
+                          file=sys.stderr,
+                      )
+                  else:
+                      print(f"Successfully created Conda environment '{env_name}'.")
+                      
+                  return success
+          
+              def create_conda_environments(self) -> None:
+                  """Iterates through found projects and creates a Conda environment for each."""
+                  all_paths = list(self.conda_env_paths)
+                  if not all_paths:
+                      print("No Conda environment files (`environment.yml`, `conda-lock.yml`) found.")
+                      return
+          
+                  print(f"Found {len(all_paths)} project(s) with Conda environment files.")
+                  for path in all_paths:
+                      self._create_conda_env_for_project(path)
+              
+              def run_dependency_check(self) -> None:
+                  """Runs the OWASP Dependency-Check tool on the entire scan path."""
+                  self.output_dir.mkdir(parents=True, exist_ok=True)
+          
+                  exclusions = [
+                      "**/.git/**",
+                      "**/__pycache__/**",
+                      "**/.pytest_cache/**",
+                      "**/.coverage/**",
+                      "**/vendor/bundle/**",
+                      "**/*.egg-info/**",
+                      "**/dependency-check/**",
+                      "**/__init__.py/**",
+                      "**/requirements.txt/**",
+                      "**/*.zip",
+                      "**/tests/**",
+                      "**/test/**",
+                      "**/spec/**",
+                      "**/.tox/**",
+                  ]
+                  
+                            
+                  dc_cmd_name = "dependency-check.sh"
+                  cmd = [
+                      dc_cmd_name,
+                      "--project", self.project_name,
+                      "--scan", str(self.scan_path),
+                      "--out", str(self.output_dir),
+                      "--data", self.data,
+                      "--enableExperimental",
+                      "--format", "HTML",
+                      "--format" "XML",
+                      "--format", "JSON",
+                      f"--failOnCVSS={self.dc_fail_cvss}",
+                  ]
+                  for exclusion in exclusions:
+                      cmd.extend(["--exclude", exclusion])
+          
+                  nvd_api_key = os.getenv("DC_API_KEY")
+                  if nvd_api_key:
+                      cmd.extend(["--nvdApiKey", nvd_api_key])
+          
+                  success, _, stderr = self._run_command(cmd, cwd=self.scan_path)
+          
+                  if not success:
+                      print("Dependency-Check failed.", file=sys.stderr)
+                      if "vulnerabilities were identified that meet or exceed the CVSS threshold" in stderr:
+                          print(
+                              "CRITICAL: Vulnerabilities found exceeding the CVSS threshold!",
+                              file=sys.stderr,
+                          )
+                          sys.exit(2)
+          
+              def scan_and_check(self) -> None:
+                  """The main orchestration method."""
+                  try:
+                      self.find_dependency_files()
+          
+                      print("--- Starting Conda environment build process ---")
+                      self.create_conda_environments()
+          
+                      print("\n--- Starting Dependency-Check vulnerability scan ---")
+                      self.run_dependency_check()
+          
+                      print("\n--- Scan complete! Reports are in:", self.output_dir, "---")
+          
+                  except Exception as e:
+                      print(f"A critical error occurred: {e}", file=sys.stderr)
+                      raise
+          
+          
+          def main():
+              parser = argparse.ArgumentParser(
+                  description="A concurrent Conda dependency builder and security vulnerability checker.",
+                  formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+              )
+              parser.add_argument(
+                  "-p", "--scan-path", required=True, help="Path to the directory to scan."
+              )
+              parser.add_argument(
+                  "-n", "--project-name", required=True, help="Project name for the final report and Conda envs."
+              )
+              parser.add_argument(
+                  "-o", "--output-dir", help="Directory to save reports.", default=None
+              )
+              parser.add_argument(
+                  "-da",
+                  "--data",
+                  help="Directory to save NVD data for Dependency-Check.",
+                  default="dependency-check/data",
+              )
+              parser.add_argument(
+                  "-d",
+                  "--max-depth",
+                  type=int,
+                  default=DEFAULT_MAX_DEPTH,
+                  help="Maximum directory depth to search for Conda environment files.",
+              )
+              parser.add_argument(
+                  "-c",
+                  "--dc-fail-cvss",
+                  type=float,
+                  default=DEFAULT_CVSS_THRESHOLD,
+                  help="CVSS score threshold to fail the build.",
+              )
+              args = parser.parse_args()
+          
+              try:
+                  scanner = DependencyScanner(
+                      scan_path=args.scan_path,
+                      project_name=args.project_name,
+                      output_dir=args.output_dir,
+                      max_depth=args.max_depth,
+                      data=args.data,
+                      dc_fail_cvss=args.dc_fail_cvss,
+                  )
+                  scanner.scan_and_check()
+              except Exception as e:
+                  print(f"Scanner failed to complete: {e}", file=sys.stderr)
+                  sys.exit(1)
+          
+          
+          if __name__ == "__main__":
+              main()
+          EOF
+          )
+          
+          echo "PYTHON_SCRIPT<<EOF" >> $GITHUB_ENV
+          echo "$PY" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+      - name: Dependency Check conda
+        run: |
+          python3 -c "$PYTHON_SCRIPT" --scan-path "${{ inputs.scan-path }}" --project-name "${{ github.repository }}" --data ~/dependency-check/data --dc-fail-cvss "${{ inputs.fail-cvss }}" --output-dir "${{ inputs.report-dir }}"
+      - name: Upload Conda artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-check-report
+          path: ${{ inputs.report-dir }}
+          retention-days: 7
+
+  code_quality_check:
+    name: Run Semgrep Code Scan
+    needs: prepare
+    uses: ./.github/workflows/code-quality-check.yml
+    with:
+      has-python: ${{ needs.prepare.outputs.has_python }}
+
+  container_scan:
+    name: Run Trivy Scan
+    needs: prepare
+    uses: ./.github/workflows/container-scan.yml
+    with:
+      scan-path: ${{ inputs.scan-path }}
+
+  codeql_analysis_scan:
+    name: Run CodeQL analysis scan
+    needs: prepare
+    uses: ./.github/workflows/codeql-security-analysis.yml
+    with:
+      working-directory: ${{ inputs.scan-path }}
+
+  checkov_security_scan:
+    name: Checkov Security Scan
+    needs: prepare
+    uses: ./.github/workflows/iac-security-scan.yml
+    with:
+      working-directory: ${{ inputs.scan-path }}
