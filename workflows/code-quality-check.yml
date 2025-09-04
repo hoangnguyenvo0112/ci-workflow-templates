@@ -1,9 +1,3 @@
-#https://github.com/ocean-network-express/ghq-bpit-vesselrefueling.git
-#jobs:
-#  scan_without_api_key:
-#    uses: ./.github/workflows/dependency_check.yml
-#Different repo
-#    uses: uses: ocean-network-express/ghq-bpit-vesselrefueling/.github/workflows/dependency_check.yml@security-testing
 name: Semgrep and Bandit Scan
 on:
   workflow_call:
