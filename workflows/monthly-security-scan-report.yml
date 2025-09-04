@@ -16,7 +16,7 @@ on:
 jobs:
   scan_source_code:
     name: Scanner Dependency Check 
-    uses: MTI-Advanced-Tec-Dept/ci-workflow-templates/.github/workflows/dependency_check.yml@security-testing
+    uses: ./.github/workflows/dependency_check.yml@security-testing
     with:
       scan-path: '.'
 
@@ -24,7 +24,7 @@ jobs:
     name: Upload Reports to GCS
     needs: [scan_source_code]
     if: always()
-    uses: MTI-Advanced-Tec-Dept/ci-workflow-templates/.github/workflows/upload-artifact-to-gcs.yml@security-testing
+    uses: ./.github/workflows/upload-artifact-to-gcs.yml@security-testing
     with:
       gcp_project_id: 'one-global-dilab-sandbox-dev'
       gcs_bucket: 'ghq-diai-prod-security-reports'
